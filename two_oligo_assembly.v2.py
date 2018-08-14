@@ -28,8 +28,9 @@ import argparse
 argparser = argparse.ArgumentParser(description='Split genes in orthogonal pieces that can be used in multiplex assembly')
 argparser.add_argument('-input_list', type=str,help='Name of file containing: mygenename DNAsequence AAsequence')
 argparser.add_argument('-adaptor_fname', type=str,default='./pool_adaptors_short_list.txt',help='Name of file containing adaptor sequences. Format: First line: column names, followed by lines: adaptor_name fiveprime_5 fiveprime_3 threeprime_5 threeprime_3')
+argparser.add_argument('-codontable_fname', type=str,default='./codontable.tab',help='Codon table to use')
 argparser.add_argument('-adaptor_number', type=int,help='What adaptor to use? starting at 1')
-argparser.add_argument('-nproc', type=int,default=1,help='Number of processors to use')
+argparser.add_argument('-nproc', type=int,default=1,help='Number of processors to use. Must be in the same node (DIGs: -cX -N1 AFAIK)')
 argparser.add_argument('-min_melt_temp', type=int,default=65,help='minimum melting temperature of the overlapping region')
 argparser.add_argument('-max_oligo_size', type=int,default=230,help='Absolute max length of orderable oligo')
 argparser.add_argument('-alignthreshold', default=15, type=int,help='Number of positions over which an alignment will be considered as such')
@@ -352,7 +353,7 @@ for line in lines:
 five_prime_addition_5, five_prime_addition_3, three_prime_addition_5, three_prime_addition_3 = read_adapters(args.adaptor_fname)
 
 #Load codons
-codonfile = open('./codontable.tab', 'r').readlines()
+codonfile = open(args.codontable_fname, 'r').readlines()
 codons = {}
 for line in codonfile:
     its = line.strip().split()
@@ -412,20 +413,22 @@ for design in designs:
     current_len_3prime_oligo = three_prime_addition_5_len + len(overlapsegment) + len(threeprime) + yeast_primer3_len
     # Now make changes until the Tm is as high as desired and the complete oligo length is
     # in a viable range:
-    for trial in range(600):
+    for trial in range(1000):
         if not ((current_len_5prime_oligo > max_oligo_size ) or (current_len_3prime_oligo > max_oligo_size )):
             break
         frame_end = get_frame_end(len(fiveprime))
         newseq = replace_codons(seq,frame_end,len(overlapsegment))
         seq = seq[:frame_end+1] + newseq + seq[frame_end+1+len(newseq):]
-        assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
+        #assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
         fiveprime, overlapsegment, threeprime = grow_overlap(startseq, seq)
         current_len_5prime_oligo = yeast_primer5_len + len(fiveprime) + len(overlapsegment) + five_prime_addition_3_len
         current_len_3prime_oligo = three_prime_addition_5_len + len(overlapsegment) + len(threeprime) + yeast_primer3_len
+	seq = fiveprime+overlapsegment+threeprime
+	assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
     skip = False
 
     if ((current_len_5prime_oligo > max_oligo_size ) or (current_len_3prime_oligo > max_oligo_size )):
-        print("Oligos are too long even after 600 optimization attempts, discarding %s and placing on Impossible design list"%design)
+        print("Oligos are too long even after 1000 optimization attempts, discarding %s and placing on Impossible design list"%design)
         skip = True
         bad_list.append(design)
         trashed_seq[design] = seq
@@ -435,6 +438,13 @@ for design in designs:
     # Create reverse complement of the overlap to search for mispriming:
     overlapsegment_rc = str(Seq(overlapsegment).reverse_complement())
     missaligned1 = []
+    '''
+    for des in curr_seq_stash:
+        # We now have to pass the reversed overlap to do the correct comparison,
+        # and see if we have significant overlap with some other protein genes
+        missaligned1 = filter_by_alignment(overlapsegment_rc[::-1],curr_seq_stash[des], alignthreshold, missaligned1 )
+    print missaligned1
+    '''
     result_fwd = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],curr_seq_stash[des],alignthreshold] for des in curr_seq_stash ])
     results_fwd = result_fwd.get()
     fwd = [ i for i in results_fwd if i > 0 ]
@@ -442,6 +452,12 @@ for design in designs:
     results_rev = result_rev.get()
     rev = [ i for i in results_rev if i > 0 ]
     missaligned1 = fwd + rev
+    #if len(missaligned1) == 1:
+    #    assert missaligned1[0] == len(overlapsegment_rc)
+    #print(missaligned1)
+
+    #p.close()
+    #p.join()
     # If there was more than the one expected alignement of the overlap to the gene:
     if (len(missaligned1) > 1) and not skip:
         print("Possible chimera detected, atempting to fix ...")
@@ -452,10 +468,11 @@ for design in designs:
             newseq = replace_codons(seq,frame_end,len(overlapsegment))
             seq = seq[:frame_end+1] + newseq + seq[frame_end+1+len(newseq):]
             curr_seq_stash[design] = seq
-            assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
+            #assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
             fiveprime, overlapsegment, threeprime = grow_overlap(startseq, seq)
+            seq = fiveprime+overlapsegment+threeprime
+            assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
             overlapsegment_rc =  str(Seq(overlapsegment).reverse_complement())
-
             result_fwd = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],curr_seq_stash[des],alignthreshold] for des in curr_seq_stash ])
             results_fwd = result_fwd.get()
             fwd = [ i for i in results_fwd if i > 0 ]
@@ -466,6 +483,7 @@ for design in designs:
 
             current_len_5prime_oligo = yeast_primer5_len + len(fiveprime) + len(overlapsegment) + five_prime_addition_3_len
             current_len_3prime_oligo = three_prime_addition_5_len + len(overlapsegment) + len(threeprime) + yeast_primer3_len
+            
 
         if (len(missaligned1) == 1) and not ((current_len_5prime_oligo > max_oligo_size ) or (current_len_3prime_oligo > max_oligo_size )):
             print("Success!")
@@ -650,3 +668,4 @@ p.join()
 
 #final_order.close()
 final_order_large.close()
+exit()
