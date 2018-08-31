@@ -28,9 +28,13 @@ import argparse
 argparser = argparse.ArgumentParser(description='Split genes in orthogonal pieces that can be used in multiplex assembly')
 argparser.add_argument('-input_list', type=str,help='Name of file containing: mygenename DNAsequence AAsequence')
 argparser.add_argument('-adaptor_fname', type=str,default='./pool_adaptors_short_list.txt',help='Name of file containing adaptor sequences. Format: First line: column names, followed by lines: adaptor_name fiveprime_5 fiveprime_3 threeprime_5 threeprime_3')
+argparser.add_argument('-codontable_fname', type=str,default='./codontable.tab',help='Codon table to use')
 argparser.add_argument('-adaptor_number', type=int,help='What adaptor to use? starting at 1')
-argparser.add_argument('-nproc', type=int,default=1,help='Number of processors to use')
-argparser.add_argument('-min_melt_temp', type=int,default=65,help='minimum melting temperature of the overlapping region')
+argparser.add_argument('-nproc', type=int,default=1,help='Number of processors to use. Must be in the same node (DIGs: -cX -N1 AFAIK)')
+argparser.add_argument('-dNTPsmM', type=float, default=0.3, help='Concentration of dNTPs in mM')
+argparser.add_argument('-MgmM', type=float, default=2.5, help='Concentration of Mg++ in mM')
+argparser.add_argument('-min_melt_temp', type=int,default=62,help='minimum melting temperature of the overlapping region')
+argparser.add_argument('-maxoverlaplen', type=int,default=30,help='What is the max overlap length?')
 argparser.add_argument('-max_oligo_size', type=int,default=230,help='Absolute max length of orderable oligo')
 argparser.add_argument('-alignthreshold', default=15, type=int,help='Number of positions over which an alignment will be considered as such')
 args = argparser.parse_args()
@@ -42,7 +46,7 @@ alignthreshold = args.alignthreshold
 #final oligos length
 #max_oligo_size = 160
 max_oligo_size = args.max_oligo_size
-#
+#pETCON adaptors:
 yeast_primer5 = "GGGTCGGCTTCGCATATG"
 yeast_primer3 = "CTCGAGGGTGGAGGTTCC"
 
@@ -58,10 +62,16 @@ impossible_sequences = open('Impossible_pool_%d.tab'%args.adaptor_number,'w')
 final_order_large = open('final_order_large_pool_%d.tab'%args.adaptor_number, 'w')
 
 def reverse_complement(seq):
+    """
+    Shortcut to get reverse complement of DNA sequence
+    """
     rc = Seq(seq, ambiguous_dna ).reverse_complement()
     return rc
 
 def read_adapters(infile):
+    """
+    Reads in the adaptor file, obetaining the correct sequences from the expected format.
+    """
     handle = open(infile, 'r')
     # get all lines, skip final newline and drop first line that has titles:
     lines = [ line[:-1] for line in handle.readlines() ][1:]
@@ -74,32 +84,18 @@ def read_adapters(infile):
     threeprime_3 = [ line.split()[4] for line in lines ]
     return fiveprime_5, fiveprime_3, threeprime_5, threeprime_3
 
-def number_to_base(num):
-    if num is 1:
-        return 'A'
-    elif num is 2:
-        return 'C'
-    elif num is 3:
-        return 'T'
-    elif num is 4:
-        return 'G'
-    else:
-        print "Input number is not 1, 2, 3 or 4, review code"
-        sys.exit(0)
-
-def get_random_bases(length):
-    s = ""
-    for i in range(length):
-        s += number_to_base(randint(1,4))
-    return s
-
-
 def isComplement(x, y):
+    """
+    Returns true if the fist argument base is complentary to the base in the second argument.
+    """
     cs = {'A': 'T', 'G': 'C', 'T': 'A', 'C': 'G'}
     return cs[x] == y
 
 
 def complement_positions(top, bottom):
+    """
+    Returns the position indexes (starts at 0) that are properly paired between the top and bottom sequences.
+    """
     positions = []
     for i, (t, b) in enumerate(zip(top, bottom)):
         if isComplement(t, b):
@@ -107,11 +103,11 @@ def complement_positions(top, bottom):
     return positions
 
 def get_score(positions):
-    # for this function see Nguyen-Dumon, BioTechniques, Vol 55, No 2, August 2013, pp 69
-    '''
+    """
     Score is the number of consecutive positions that paired in the input
     alignment positions.
-    '''
+    For this function see Nguyen-Dumon, BioTechniques, Vol 55, No 2, August 2013, pp 69
+    """
     score = 0
     maxscore = 0
     if len(positions) == 1:
@@ -133,7 +129,10 @@ def get_score(positions):
 
 
 class Dimer(object):
-    # for this class see Nguyen-Dumon, BioTechniques, Vol. 55, No. 2, August 2013, pp. 69
+    """
+    For this class see Nguyen-Dumon, BioTechniques, Vol. 55, No. 2, August 2013, pp. 69
+    This object is used in the chimera evaluation.
+    """
     def __init__(self, top, bottom=None):
         self._top = top
         # If bottom not available: do it against top itself
@@ -199,26 +198,20 @@ class Dimer(object):
 #end of Nguyen-Dumon et al., BioTechniques, Vol. 55, No. 2, August 2013, pp. 69
 
 def is_part(array,idx):
+    """
+    Returns True if idx is in array
+    """
     for i in array:
         if i == idx:
             return True
     else:
         return False
 
-def fill_sequence_dictionary(seq_name, new_seq, current_sequences):
-    updated_sequences = {}
-    updated_sequences[seq_name] = new_seq
-    for n in current_sequences.keys():
-        updated_sequences[n] = current_sequences[n]
 
-#all on base count level
 def replace_codons(s,frame_end,overlap_len):
-
-    # this is to keep track of the whole sequence:
-    #remainder = s[:frame_end+1] #inclusive for frame_end
-    #print "Remainder:"
-    #print remainder
-
+    """
+    Returns a new sequence encoding for the same peptide, but with different codons in the overlap region.
+    """
     #starting at the first position for new codon hence +1
     randomized_positions = [i for i in range((frame_end+1)/3, (frame_end+1+ overlap_len)/3 )]
     shuffle(randomized_positions)
@@ -230,7 +223,8 @@ def replace_codons(s,frame_end,overlap_len):
 
     sh = ""
     for p in range(frame_end+1,frame_end+1+overlap_len, 3):
-        if is_part(a,p/3):
+        #if is_part(a,p/3):
+        if p/3 in a:
             #Make a new codon
             codon = ''
             for i in range(3):
@@ -246,6 +240,10 @@ def replace_codons(s,frame_end,overlap_len):
     return sh
 
 def filter_by_alignment_p(arg_list):
+    """
+    Takes a senquence and the reverse complement of the current overlap, and searches for possible priming in other sequences.
+    Returns the scores of the aligment that are above the input threshold. The score is just the number of bases properly aligned.
+    """
     rc = arg_list[0]
     s2 = arg_list[1]
     align_threshold = arg_list[2]
@@ -255,54 +253,43 @@ def filter_by_alignment_p(arg_list):
     else:
         return 0
 
-def filter_by_alignment(rc,s2, align_threshold, container1):
-    sc1 = Dimer(rc, s2).score(align_threshold)
-    s2_revcomp = str(Seq(s2).reverse_complement())
-    sc2 = Dimer(rc, s2_revcomp).score(align_threshold)
-    if sc1 > align_threshold:
-        container1.append(sc1)
-    if sc2 > align_threshold:
-        container1.append(sc2)
-
-    return container1
-
 def grow_overlap(startpoint, seq):
-    '''
+    """
+    Returns the sequence divided in three parts: 5', overlap and 3'.
     Overlap grows from the middle outwards, regardless of the oligo length limit, that
     is checked afterwards, and if it's not good enough codons get swapped randomly until
-    the overlap has the proper length and Tm. The retuned stings are the three parts of
+    the overlap has the proper length and Tm. The returned stings are the three parts of
     sequence: five prime unique section, the overlap that will be later added to both,
     and the three-prime unique section.
-    '''
-
-    #seed for primer, start with min primer length
-    #for i in range(startpoint, startpoint + min_primer_length):
-    #    overlap += seq[i]
-
+    """
     #Minimum length of the overlap must be len = Tm/4, which assumes that it's %100 GC:
     min_len = minmelt/4
     overlap = seq[startpoint - min_len/2 : startpoint] + seq[startpoint : startpoint + min_len/2 ]
     counter = 0
     firsthalf = seq[:(startpoint - min_len/2 - counter)]
-    tm = MeltingTemp.Tm_staluc(overlap)
-
-    while (tm < minmelt) and (startpoint + min_len/2 + counter < len(seq)) :
+    tm = MeltingTemp.Tm_NN(overlap, Na=50, K=0, Tris=0, Mg=args.MgmM, dNTPs=args.dNTPsmM )
+    gc = GC(overlap) 
+    while (min_len/2 + counter < args.maxoverlaplen) and ( (tm < minmelt) or ( (gc < 40) or (gc > 60) ) ): # GC% must be between 40 and 60, Tm should be above mininimum, and the overlap should not be longer than 30bps
         counter += 1
         overlap = seq[startpoint - min_len/2 - counter] + overlap + seq[startpoint + min_len/2 + counter - 1]
-        #Tm = 4(G + C) + 2(A + T)=Temp(C)
-        tm = MeltingTemp.Tm_staluc(overlap)
-
+        tm = MeltingTemp.Tm_NN(overlap, Na=50, K=0, Tris=0, Mg=args.MgmM, dNTPs=args.dNTPsmM )
+        gc = GC(overlap)
+    #print(counter)
     firsthalf = seq[:(startpoint - min_len/2 - counter)]
     secondhalf = seq[(startpoint + min_len/2 + counter):len(seq)]
     #print len(firsthalf + overlap + secondhalf), len(seq)
+    #print(firsthalf)
+    #print(overlap)
+    #print(secondhalf)
     assert len(firsthalf + overlap + secondhalf) == len(seq)
     assert firsthalf + overlap + secondhalf == seq
-    assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
+    #assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design] # this is done later
     return firsthalf, overlap, secondhalf
 
 def get_frame_end(startpoint):
-
-    ## determine the frame, assuming input sequences given were all inframe
+    """
+    Returns the frame end given the that the sequence has length "startpoint"
+    """
     frameend = startpoint
 
     if frameend % 3 == 0 :
@@ -311,20 +298,6 @@ def get_frame_end(startpoint):
         frameend += 1
 
     return frameend
-
-def record_redesigned_sequence(mydesign,myseq,mynewseq,end,a1,a2):
-    '''
-    Record redesigned sequences to file and update sequence array
-    (which will be evenutally formated with adapters)
-    '''
-    a1.append(myseq[0:end+1] + mynewseq)
-    a2.append(mynewseq + myseq[(end +1) + len(mynewseq):len(myseq)])
-
-    #print >> order_sequences, mydesign + '_1st' , myseq[0:end+1] + mynewseq
-    #print >> order_sequences, mydesign + '_2nd' , mynewseq + myseq[(end +1) + len(mynewseq):len(myseq)]
-    print >> final_sequences, mydesign , myseq[0:end+1] + mynewseq + seq[(end +1) + len(mynewseq):len(myseq)]
-
-    #return a1,a2
 
 '''
 BEGGINING OF MAIN:
@@ -352,7 +325,7 @@ for line in lines:
 five_prime_addition_5, five_prime_addition_3, three_prime_addition_5, three_prime_addition_3 = read_adapters(args.adaptor_fname)
 
 #Load codons
-codonfile = open('./codontable.tab', 'r').readlines()
+codonfile = open(args.codontable_fname, 'r').readlines()
 codons = {}
 for line in codonfile:
     its = line.strip().split()
@@ -385,6 +358,8 @@ oligos5 = []
 oligos3 = []
 names = []
 
+overlap_report_handle = open('overlap_report_%d.txt'%args.adaptor_number, 'w')
+
 """
 End of setup, now go design by design and optimize overlaps:
 """
@@ -410,65 +385,88 @@ for design in designs:
     yeast_primer3_len = len(yeast_primer3)
     current_len_5prime_oligo = yeast_primer5_len + len(fiveprime) + len(overlapsegment) + five_prime_addition_3_len
     current_len_3prime_oligo = three_prime_addition_5_len + len(overlapsegment) + len(threeprime) + yeast_primer3_len
-    # Now make changes until the Tm is as high as desired and the complete oligo length is
+    # Now make changes until the Tm is as high as desired, the GC% is between 40% and 60%, and the complete oligo length is
     # in a viable range:
-    for trial in range(600):
-        if not ((current_len_5prime_oligo > max_oligo_size ) or (current_len_3prime_oligo > max_oligo_size )):
-            break
+    for trial in range(1000):
+	tm = MeltingTemp.Tm_NN(overlapsegment, Na=50, K=0, Tris=0, Mg=args.MgmM, dNTPs=args.dNTPsmM )
+        gc = GC(overlapsegment) 
+        if (tm >= minmelt) and ( (gc > 40) and (gc<60) ) and (len(overlapsegment) <= args.maxoverlaplen ):
+            if not ((current_len_5prime_oligo > max_oligo_size ) or (current_len_3prime_oligo > max_oligo_size )):
+                 break
         frame_end = get_frame_end(len(fiveprime))
         newseq = replace_codons(seq,frame_end,len(overlapsegment))
         seq = seq[:frame_end+1] + newseq + seq[frame_end+1+len(newseq):]
-        assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
+        #assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
         fiveprime, overlapsegment, threeprime = grow_overlap(startseq, seq)
         current_len_5prime_oligo = yeast_primer5_len + len(fiveprime) + len(overlapsegment) + five_prime_addition_3_len
         current_len_3prime_oligo = three_prime_addition_5_len + len(overlapsegment) + len(threeprime) + yeast_primer3_len
+	seq = fiveprime+overlapsegment+threeprime
+	#assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
     skip = False
-
-    if ((current_len_5prime_oligo > max_oligo_size ) or (current_len_3prime_oligo > max_oligo_size )):
-        print("Oligos are too long even after 600 optimization attempts, discarding %s and placing on Impossible design list"%design)
+    tm = MeltingTemp.Tm_NN(overlapsegment, Na=50, K=0, Tris=0, Mg=args.MgmM, dNTPs=args.dNTPsmM ); gc = GC(overlapsegment); overlapsegment_len = len(overlapsegment)
+    # After 1000 attempts are done, check if sequence passes requierements:
+    if ((current_len_5prime_oligo > max_oligo_size ) or (current_len_3prime_oligo > max_oligo_size )) or (not ( (tm>= minmelt ) and ( (gc>40) and (gc<60) ) and (overlapsegment_len<= args.maxoverlaplen) ) ):
+        print("Oligos do not pass requirements even after 1000 optimization attempts, discarding %s and placing on Impossible design list"%design)
         skip = True
         bad_list.append(design)
         trashed_seq[design] = seq
         print >> impossible_sequences, design, seq
-
     curr_seq_stash[design] = seq
     # Create reverse complement of the overlap to search for mispriming:
     overlapsegment_rc = str(Seq(overlapsegment).reverse_complement())
     missaligned1 = []
-    result_fwd = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],curr_seq_stash[des],alignthreshold] for des in curr_seq_stash ])
+    # Check for priming in other sequences:
+    #result_fwd = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],curr_seq_stash[des],alignthreshold] for des in curr_seq_stash ])
+    result_fwd = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],final_seq[des],alignthreshold] for des in final_seq ])
     results_fwd = result_fwd.get()
     fwd = [ i for i in results_fwd if i > 0 ]
-    result_rev = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],str(Seq(curr_seq_stash[des]).reverse_complement()),alignthreshold] for des in curr_seq_stash ])
+    #result_rev = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],str(Seq(curr_seq_stash[des]).reverse_complement()),alignthreshold] for des in curr_seq_stash ])
+    result_rev = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],str(Seq(final_seq[des]).reverse_complement()),alignthreshold] for des in final_seq ])
     results_rev = result_rev.get()
     rev = [ i for i in results_rev if i > 0 ]
     missaligned1 = fwd + rev
-    # If there was more than the one expected alignement of the overlap to the gene:
+    
+    # If there was more than the one expected alignement of the overlap to a gene:
     if (len(missaligned1) > 1) and not skip:
+        fixed = False
         print("Possible chimera detected, atempting to fix ...")
         for trial in range(20):
-            if (len(missaligned1) == 1) and not ((current_len_5prime_oligo > max_oligo_size ) or (current_len_3prime_oligo > max_oligo_size )):
-                break
             frame_end = get_frame_end(len(fiveprime))
             newseq = replace_codons(seq,frame_end,len(overlapsegment))
             seq = seq[:frame_end+1] + newseq + seq[frame_end+1+len(newseq):]
             curr_seq_stash[design] = seq
-            assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
             fiveprime, overlapsegment, threeprime = grow_overlap(startseq, seq)
+            seq = fiveprime+overlapsegment+threeprime
+            #assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
             overlapsegment_rc =  str(Seq(overlapsegment).reverse_complement())
-
-            result_fwd = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],curr_seq_stash[des],alignthreshold] for des in curr_seq_stash ])
+            #result_fwd = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],curr_seq_stash[des],alignthreshold] for des in curr_seq_stash ])
+            result_fwd = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],final_seq[des],alignthreshold] for des in final_seq ])
             results_fwd = result_fwd.get()
             fwd = [ i for i in results_fwd if i > 0 ]
-            result_rev = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],str(Seq(curr_seq_stash[des]).reverse_complement()),alignthreshold] for des in curr_seq_stash ])
+            #result_rev = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],str(Seq(curr_seq_stash[des]).reverse_complement()),alignthreshold] for des in curr_seq_stash ])
+            result_rev = p.map_async(filter_by_alignment_p,[ [overlapsegment_rc[::-1],str(Seq(final_seq[des]).reverse_complement()),alignthreshold] for des in final_seq ])
             results_rev = result_rev.get()
             rev = [ i for i in results_rev if i > 0 ]
             missaligned1 = fwd + rev
 
             current_len_5prime_oligo = yeast_primer5_len + len(fiveprime) + len(overlapsegment) + five_prime_addition_3_len
             current_len_3prime_oligo = three_prime_addition_5_len + len(overlapsegment) + len(threeprime) + yeast_primer3_len
+            
+            if (len(missaligned1) == 1) and not ((current_len_5prime_oligo > max_oligo_size ) or (current_len_3prime_oligo > max_oligo_size )):
+                tm = MeltingTemp.Tm_NN(overlapsegment, Na=50, K=0, Tris=0, Mg=args.MgmM, dNTPs=args.dNTPsmM )
+                gc = GC(overlapsegment)
+                if (tm >= minmelt) and ( (gc > 40) and (gc<60) ) and (len(overlapsegment) <= args.maxoverlaplen ):
+                    fixed = True
+                    break
 
-        if (len(missaligned1) == 1) and not ((current_len_5prime_oligo > max_oligo_size ) or (current_len_3prime_oligo > max_oligo_size )):
+        if fixed:
             print("Success!")
+            assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
+            Tm = MeltingTemp.Tm_NN(overlapsegment, Na=50, K=0, Tris=0, Mg=args.MgmM, dNTPs=args.dNTPsmM )
+            GC_cont = GC(overlapsegment)
+            print("%s length: %d Tm: %02f GC: %d"%(overlapsegment,len(overlapsegment),Tm,GC_cont))
+            print >> overlap_report_handle, "%s,%s,%d,%02f,%d"%(design,overlapsegment,len(overlapsegment),Tm,GC_cont)
+
             print >> final_sequences, design , seq
             names.append(design)
             final_seq[design] = seq
@@ -481,17 +479,20 @@ for design in designs:
             print >> trashed_sequences, design, seq
 
     elif not skip:
+	assert str(Seq(seq, unambiguous_dna).translate()) == protein_seqs[design]
+        Tm = MeltingTemp.Tm_NN(overlapsegment, Na=50, K=0, Tris=0, Mg=args.MgmM, dNTPs=args.dNTPsmM )
+        GC_cont = GC(overlapsegment)
+	print("%s length: %d Tm: %02f GC: %d"%(overlapsegment,len(overlapsegment),Tm,GC_cont))
+        print >> overlap_report_handle, "%s,%s,%d,%02f,%d"%(design,overlapsegment,len(overlapsegment),Tm,GC_cont)
         final_seq[design] = seq
         oligos5.append(fiveprime + overlapsegment )
         oligos3.append(overlapsegment + threeprime)
         names.append(design)
 
         print >> final_sequences, design , seq
-        #print >> order_sequences, design + '_1st', fiveprime + overlapsegment
-        #print >> order_sequences, design + '_2st', overlapsegment + threeprime
 
     ## update design pool after each processed design sequence
-    curr_seq_stash.clear()#  = {}
+    curr_seq_stash.clear()
     for des in final_seq:
         curr_seq_stash[des] = final_seq[des]
 
@@ -506,7 +507,6 @@ for design in designs:
 trashed_sequences.close()
 final_sequences.close()
 impossible_sequences.close()
-#order_sequences.close()
 
 if len(oligos3) != len(oligos5):
     print "Number of 3' oligos (%i) is different from number of 5' oligos (%i)"%(len(oligos3),len(oligos5))
@@ -515,26 +515,9 @@ if len(oligos3) != len(oligos5):
 print len(oligos3),len(names)
 
 
-###################### output formating section ... #######################
-
-
-batch_small_id = adapter_idx
 batch_big_id = adapter_idx
 report = open('report_%d.txt'%args.adaptor_number, 'w')
-
 distributions =[0] * len(five_prime_addition_5)
-
-#gene sequence: up to 61 residues
-#5' oligos:  (160bp)  17bp outside primer + (+ random bits) + 18bp yeast adaptor + gene half + overlap + AA + 17bp outside primer
-#3' oligos:  (160bp)  17bp outside primer + TT + 30 overlap + 93 unique + 18bp yeast adaptor + ( random bits) +17bp outside primer
-
-#gene sequence: up to 72 residues
-#5' oligos:  (160bp)  18bp yeast adaptor +  unique + overlap + AA + 17bp outside primer (+ random bits)
-#3' oligos:  (160bp)  17bp outside primer + TT + 30 overlap + 93 unique + 18bp yeast adaptor (+ random bits)
-
-#using first 6 set for shorter genes and the last 6 for longer genes
-
-## defining size limits -- asuming adapter are equal lengths, adjust as needed ####
 upper_limit = max_oligo_size - len(yeast_primer5) - len(five_prime_addition_5[0])
 lower_limit = max_oligo_size - len(yeast_primer5) - len(five_prime_addition_5[0]) -len(three_prime_addition_3[0])
 
@@ -546,53 +529,13 @@ for idx in range(len(oligos3)):
 
     fivePlen = len(oligos5[idx])
     threePlen = len(oligos3[idx])
-    '''
-    if fivePlen < lower_limit and threePlen  < lower_limit :
-        type1 += 1
-
-        distributions[batch_small_id] += 1
-
-        ###  5' oligo  - adding random pieces between 5 addition and yeast adapter to adjust size to max length
-        s1 = five_prime_addition_5[batch_small_id]
-        addition = get_random_bases( max_oligo_size - len(five_prime_addition_5[batch_small_id]  + yeast_primer5 + oligos5[idx] + five_prime_addition_3[batch_small_id] ))
-
-        s1 += addition
-        s1 += yeast_primer5 + oligos5[idx] + five_prime_addition_3[batch_small_id]
-
-        ### 3' oligo - adding after yeast adapter before 3' addition
-        s2 = three_prime_addition_5[batch_small_id] + oligos3[idx]  + yeast_primer3
-        addition = get_random_bases( max_oligo_size - len(three_prime_addition_5[batch_small_id] + oligos3[idx] + three_prime_addition_3[batch_small_id] + yeast_primer3))
-        s2 += addition
-        s2 += three_prime_addition_3[batch_small_id]
-
-        print >>final_order, names[idx] + '_1st' , s1
-        print >>final_order, names[idx] + '_2nd' , s2
-
-	# update not necessary for this version, all one idx as specified by the user
-        #batch_small_id += 1
-        #if batch_small_id > 2 :#only the first 3 will be used for the smaller
-        #    batch_small_id = 0
-    '''
+    
     if fivePlen < upper_limit and threePlen < upper_limit :
-
         type2 += 1
-
-        #batch_big_id += 1
-
-        #if batch_big_id > 9:# 5-10 , in python 4 - 9 of the adapters are used for the bigger designs
-        #    batch_big_id = 5 # reset
         distributions[batch_big_id] += 1
-
         #adding to end random bases for customArray synthesis
         s1 = yeast_primer5 + oligos5[idx] + five_prime_addition_3[batch_big_id]
-        #addition = get_random_bases( max_oligo_size - len(s1))
-        #s1 = s1 + addition
-
-        #if len(s2) < max_oligo_size+1:
         s2 = three_prime_addition_5[batch_big_id] + oligos3[idx] + yeast_primer3
-        #addition = get_random_bases( max_oligo_size - len(s2))
-        #s2 += addition
-        #print len(s1), len(s2), max_oligo_size
 
         # If these asserts go off, you messed up something:
         assert len(s1) <= max_oligo_size # Final product len < max oligo len
@@ -600,53 +543,21 @@ for idx in range(len(oligos3)):
         print >>final_order_large, names[idx] + '_1st' , s1
         print >>final_order_large, names[idx] + '_2nd' , s2
 
-        #batch_big_id += 1
-        #if batch_big_id > 4:# 5-10 , in python 4 - 9 of the adapters are used for the bigger designs
-        #    batch_big_id = 3 # rlen(five_prime_addition_5)
 
     else:
         print names[idx], "is too big!!" , fivePlen, threePlen, "limits:" , lower_limit, upper_limit, oligos5[idx], oligos3[idx]
 	print >> report , names[idx], "is too big!!" , fivePlen, threePlen, "limits:" , lower_limit, upper_limit, oligos5[idx], oligos3[idx]
 
-print "double primer sequences: " , type1,"single", type2
 print >> report ,"\nshort primers with double custom primers:", type1, "with single " , type2,"\n"
 
-tmp3 = []
-tmp5 = []
-
-# uncomment this section if you would like a histogram of the lengths of the different oligos
-# need matplotlib for that
-#
-#for i in range(len(oligos3)):
-#    tmp3.append(len(oligos3[i]))
-#    tmp5.append(len(oligos5[i]))
-
-#plt.subplots(figsize= (6,6))
-#plt.hist(tmp5, alpha=0.5, label='oligo5')
-#plt.hist(tmp3, alpha=0.5, label='oligo3')
-#plt.legend(loc='upper right')
-#plt.show()
-#plt.savefig('hist_oligos.png')
 
 print distributions
 print >> report,"adapter distributions:", distributions
 
-#print >> report, "summary of olgios and tags\n, this doesnt include the trashed ones, as those will be combined in the last two pools"
-#for i in range(len(distributions)):
-#    print >> report, "-------------------\n","pool" + str(i) + "\n-------------------"
-#    print >> report,  str(distributions[i]) , "counts"
-#    print >> report, "\nfive prime oligo:\n","5\'end ", five_prime_addition_5[i], "3\'", five_prime_addition_3[i],'\n'
-#    print >> report, "three prime oligo:\n","5\' end" ,three_prime_addition_5[i], "3\'",three_prime_addition_3[i]
-
-#    if i > 4:
-#        print >> report, "-------------------\n","pool" + str(i) + "\n-------------------"
-#        print >> report,  str(distributions[i]),"counts"
-#        print >> report, "\nfive prime oligo:\n","3\' end",five_prime_addition_3[i] ,'\n'
-#        print >> report, "three prime oligo:\n","3\' end",three_prime_addition_5[i]
 
 report.close()
 p.close()
 p.join()
 
-#final_order.close()
 final_order_large.close()
+overlap_report_handle.close()
